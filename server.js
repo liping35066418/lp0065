@@ -147,6 +147,11 @@ wss.on('connection', (ws, req) => {
 
       if (data.type === 'set_mode') {
         client.currentMode = data.mode || 'auto';
+        client.detectionCount = 0;
+        client.segmentBuffer = [];
+        client.lastDetection = null;
+        client.lastDetectAt = 0;
+        client.lastSegmentAt = 0;
         ws.send(JSON.stringify({
           type: 'mode_changed',
           mode: client.currentMode,

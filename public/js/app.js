@@ -25,7 +25,8 @@ const AppState = {
   confidenceSum: 0,
   langCounts: { zh: 0, en: 0, ja: 0, ko: 0, fr: 0, de: 0 },
   currentMode: 'auto',
-  chunkCounter: 0
+  chunkCounter: 0,
+  selectedLangFilter: null
 };
 
 const LangLabels = {
@@ -154,7 +155,7 @@ function initCanvas() {
 function initLangBars() {
   const langs = ['zh', 'en', 'ja', 'ko', 'fr', 'de'];
   elements.langBars.innerHTML = langs.map(code => `
-    <div class="lang-bar-item">
+    <div class="lang-bar-item" data-lang="${code}">
       <span class="lang-bar-label">${LangLabels[code]}</span>
       <div class="lang-bar-track">
         <div class="lang-bar-fill ${code}" id="langFill-${code}" style="width: 0%"></div>
@@ -162,6 +163,34 @@ function initLangBars() {
       <span class="lang-bar-count" id="langCount-${code}">0</span>
     </div>
   `).join('');
+
+  elements.langBars.querySelectorAll('.lang-bar-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const lang = item.dataset.lang;
+      toggleLangFilter(lang);
+    });
+  });
+}
+
+function toggleLangFilter(lang) {
+  if (AppState.selectedLangFilter === lang) {
+    AppState.selectedLangFilter = null;
+  } else {
+    AppState.selectedLangFilter = lang;
+  }
+  updateLangBarHighlight();
+  renderAllSegments();
+  updateSegmentCount();
+}
+
+function updateLangBarHighlight() {
+  elements.langBars.querySelectorAll('.lang-bar-item').forEach(item => {
+    if (item.dataset.lang === AppState.selectedLangFilter) {
+      item.classList.add('active');
+    } else {
+      item.classList.remove('active');
+    }
+  });
 }
 
 function connectWebSocket() {
@@ -395,6 +424,39 @@ function formatTime(ms) {
 function handleModeChange(e) {
   AppState.currentMode = e.target.value;
   sendModeChange(AppState.currentMode);
+
+  AppState.detections = [];
+  AppState.segments = [];
+  AppState.totalDuration = 0;
+  AppState.confidenceSum = 0;
+  AppState.langCounts = { zh: 0, en: 0, ja: 0, ko: 0, fr: 0, de: 0 };
+  AppState.selectedLangFilter = null;
+
+  elements.languageValue.textContent = '--';
+  elements.accentValue.textContent = '--';
+  elements.detectionId.textContent = '#0';
+  elements.confidenceFill.style.width = '0%';
+  elements.confidenceValue.textContent = '0%';
+  elements.confidenceFill.classList.remove('high', 'medium', 'low');
+  elements.confidenceValue.style.color = '';
+
+  elements.segmentsList.innerHTML = `
+    <div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+        <line x1="12" y1="19" x2="12" y2="23"></line>
+        <line x1="8" y1="23" x2="16" y2="23"></line>
+      </svg>
+      <p>暂无识别记录</p>
+      <p class="empty-hint">启动麦克风开始语音采集</p>
+    </div>
+  `;
+
+  updateStats();
+  updateLangDistribution();
+  updateLangBarHighlight();
+  updateSegmentCount();
 }
 
 function sendModeChange(mode) {
@@ -439,9 +501,13 @@ function handleDetection(data) {
 function handleSegment(data) {
   AppState.segments.unshift(data);
   AppState.totalDuration += data.duration;
-  renderSegment(data);
-  elements.segmentCount.textContent = AppState.segments.length;
+
+  if (!AppState.selectedLangFilter || AppState.selectedLangFilter === data.language) {
+    renderSegment(data);
+  }
+
   updateStats();
+  updateSegmentCount();
 }
 
 function handleAudioAck(data) {
@@ -452,7 +518,7 @@ function handleAudioAck(data) {
 }
 
 function renderSegment(segment) {
-  if (AppState.segments.length === 1) {
+  if (AppState.segments.length === 1 && !AppState.selectedLangFilter) {
     elements.segmentsList.innerHTML = '';
   }
 
@@ -486,6 +552,65 @@ function renderSegment(segment) {
   }
 }
 
+function renderAllSegments() {
+  const filtered = AppState.selectedLangFilter
+    ? AppState.segments.filter(s => s.language === AppState.selectedLangFilter)
+    : AppState.segments;
+
+  if (filtered.length === 0) {
+    const hintText = AppState.selectedLangFilter
+      ? `当前筛选下暂无${LangLabels[AppState.selectedLangFilter]}记录`
+      : '暂无识别记录';
+    elements.segmentsList.innerHTML = `
+      <div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+          <line x1="12" y1="19" x2="12" y2="23"></line>
+          <line x1="8" y1="23" x2="16" y2="23"></line>
+        </svg>
+        <p>${hintText}</p>
+        <p class="empty-hint">${AppState.selectedLangFilter ? '点击语种分布切换筛选' : '启动麦克风开始语音采集'}</p>
+      </div>
+    `;
+    return;
+  }
+
+  elements.segmentsList.innerHTML = '';
+  filtered.forEach(segment => {
+    const confPct = Math.round(segment.confidence * 100);
+    const timeStr = new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false });
+
+    const item = document.createElement('div');
+    item.className = 'segment-item';
+    item.dataset.lang = segment.language;
+    item.innerHTML = `
+      <div class="segment-header">
+        <div class="segment-tags">
+          <span class="segment-tag lang">${segment.languageName}</span>
+          <span class="segment-tag accent">${segment.accent}</span>
+          <span class="segment-tag confidence">${confPct}%</span>
+        </div>
+        <span class="segment-time">${timeStr}</span>
+      </div>
+      <div class="segment-text">${escapeHtml(segment.text)}</div>
+      <div class="segment-meta">
+        <span>⏱ 时长 ${segment.duration.toFixed(1)}s</span>
+        <span>📊 置信度 ${confPct}%</span>
+        <span>#${segment.id.toString().slice(-6)}</span>
+      </div>
+    `;
+    elements.segmentsList.appendChild(item);
+  });
+}
+
+function updateSegmentCount() {
+  const filtered = AppState.selectedLangFilter
+    ? AppState.segments.filter(s => s.language === AppState.selectedLangFilter)
+    : AppState.segments;
+  elements.segmentCount.textContent = filtered.length;
+}
+
 function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
@@ -497,6 +622,7 @@ function clearSegments() {
   if (!confirm('确定要清空所有识别记录吗？')) return;
 
   AppState.segments = [];
+  AppState.selectedLangFilter = null;
   elements.segmentCount.textContent = '0';
   elements.segmentsList.innerHTML = `
     <div class="empty-state">
@@ -517,6 +643,7 @@ function clearSegments() {
   AppState.langCounts = { zh: 0, en: 0, ja: 0, ko: 0, fr: 0, de: 0 };
   updateStats();
   updateLangDistribution();
+  updateLangBarHighlight();
 }
 
 function updateStats() {
