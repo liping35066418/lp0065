@@ -18,35 +18,75 @@ const LANGUAGES = {
 
 const LANGUAGE_POOL = Object.keys(LANGUAGES);
 
-function generateConfidence(base = 0.7) {
-  return Math.min(0.99, Math.max(0.3, base + (Math.random() - 0.5) * 0.4));
+function stableHash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) ^ str.charCodeAt(i);
+  }
+  return (hash >>> 0) / 0xffffffff;
+}
+
+function featureSeed(features) {
+  const key = `${features.rms.toFixed(6)}|${features.zcr.toFixed(6)}|${features.energy.toFixed(6)}|${features.peak.toFixed(6)}|${features.centroid.toFixed(6)}`;
+  return stableHash(key);
+}
+
+function pickIndex(seed, length) {
+  return Math.floor(seed * length) % length;
+}
+
+function generateConfidence(features, base = 0.7) {
+  const clarity = Math.min(1, (features.rms * 5 + features.peak * 2) / 3);
+  const variation = features.zcr * 0.15;
+  return Math.min(0.99, Math.max(0.3, base + clarity * 0.2 - variation));
 }
 
 function detectLanguage(audioFeatures, currentMode) {
+  const seed = featureSeed(audioFeatures);
+
   if (currentMode && currentMode !== 'auto') {
     const lang = LANGUAGES[currentMode];
     if (lang) {
-      const accent = lang.accents[Math.floor(Math.random() * lang.accents.length)];
+      const accentIdx = pickIndex(seed * 7.3, lang.accents.length);
       return {
         language: lang.code,
         languageName: lang.name,
-        accent: accent,
-        confidence: generateConfidence(0.85)
+        accent: lang.accents[accentIdx],
+        confidence: generateConfidence(audioFeatures, 0.85)
       };
     }
   }
-  const langCode = LANGUAGE_POOL[Math.floor(Math.random() * LANGUAGE_POOL.length)];
+
+  const zcrScore = audioFeatures.zcr;
+  const rmsScore = audioFeatures.rms;
+  const centroidScore = audioFeatures.centroid;
+
+  const langScores = {
+    zh: 0.5 + zcrScore * 1.5 + (centroidScore > 0.4 ? 0.15 : 0),
+    en: 0.45 + rmsScore * 1.2 + (centroidScore > 0.35 && centroidScore < 0.55 ? 0.15 : 0),
+    ja: 0.55 + zcrScore * 1.2 + (centroidScore > 0.45 ? 0.1 : 0),
+    ko: 0.48 + zcrScore * 1.3 + (centroidScore > 0.38 ? 0.12 : 0),
+    fr: 0.42 + rmsScore * 0.9 + (centroidScore < 0.45 ? 0.15 : 0),
+    de: 0.4 + rmsScore * 1.0 + (centroidScore < 0.4 ? 0.18 : 0)
+  };
+
+  const hashBoost = seed * 0.1;
+  Object.keys(langScores).forEach(k => { langScores[k] += hashBoost * stableHash(k); });
+
+  const sorted = Object.entries(langScores).sort((a, b) => b[1] - a[1]);
+  const langCode = sorted[0][0];
   const lang = LANGUAGES[langCode];
-  const accent = lang.accents[Math.floor(Math.random() * lang.accents.length)];
+  const accentIdx = pickIndex(seed * 3.7 + langScores[langCode], lang.accents.length);
+
   return {
     language: langCode,
     languageName: lang.name,
-    accent: accent,
-    confidence: generateConfidence(0.65)
+    accent: lang.accents[accentIdx],
+    confidence: generateConfidence(audioFeatures, 0.6 + sorted[0][1] * 0.15)
   };
 }
 
-function generateSegmentText(language) {
+function generateSegmentText(language, features) {
   const samples = {
     zh: ['你好，很高兴认识你', '今天天气真不错', '语音识别技术很有趣', '人工智能正在改变世界', '学习是一种终身习惯'],
     en: ['Hello, nice to meet you', 'The weather is lovely today', 'Speech recognition is amazing', 'AI is changing the world', 'Learning is a lifelong habit'],
@@ -56,7 +96,9 @@ function generateSegmentText(language) {
     de: ['Hallo, freut mich', 'Das Wetter ist heute schön', 'Spracherkennung ist faszinierend', 'KI verändert die Welt', 'Lernen ist eine lebenslange Gewohnheit']
   };
   const pool = samples[language] || samples.en;
-  return pool[Math.floor(Math.random() * pool.length)];
+  const seed = featureSeed(features);
+  const idx = pickIndex(seed * 11.3 + stableHash(language), pool.length);
+  return pool[idx];
 }
 
 const voiceApp = express();
@@ -127,9 +169,16 @@ wss.on('connection', (ws, req) => {
           client.audioBuffer.shift();
         }
 
-        if (Math.random() < 0.15) {
+        const hasVoice = features.rms > 0.02 && features.peak > 0.1;
+        const detectionCooldown = 300;
+        const now = Date.now();
+        const lastDetectAt = client.lastDetectAt || 0;
+        const canDetect = now - lastDetectAt > detectionCooldown;
+
+        if (hasVoice && canDetect) {
           const result = detectLanguage(features, client.currentMode);
           client.lastDetection = result;
+          client.lastDetectAt = now;
           client.detectionCount++;
 
           ws.send(JSON.stringify({
@@ -139,8 +188,14 @@ wss.on('connection', (ws, req) => {
             detectionId: client.detectionCount
           }));
 
-          if (Math.random() < 0.08) {
-            const segmentText = generateSegmentText(result.language);
+          const segmentCooldown = 1500;
+          const lastSegmentAt = client.lastSegmentAt || 0;
+          const canSegment = now - lastSegmentAt > segmentCooldown;
+          const strongVoice = features.rms > 0.06 && features.energy > 0.04;
+
+          if (canSegment && strongVoice) {
+            const segmentText = generateSegmentText(result.language, features);
+            const durationBase = Math.min(5, Math.max(0.8, features.rms * 20 + features.energy * 10));
             const segment = {
               id: Date.now(),
               text: segmentText,
@@ -148,10 +203,11 @@ wss.on('connection', (ws, req) => {
               languageName: result.languageName,
               accent: result.accent,
               confidence: result.confidence,
-              duration: 1 + Math.random() * 3,
+              duration: durationBase,
               timestamp: Date.now()
             };
             client.segmentBuffer.push(segment);
+            client.lastSegmentAt = now;
 
             ws.send(JSON.stringify({
               type: 'segment',
@@ -192,6 +248,8 @@ function extractAudioFeatures(audioData) {
   let energy = 0;
   let zcr = 0;
   let prevSample = 0;
+  let weightedSum = 0;
+  let freqWeight = 0;
 
   for (let i = 0; i < audioData.length; i++) {
     const sample = audioData[i];
@@ -201,16 +259,23 @@ function extractAudioFeatures(audioData) {
     if ((prevSample >= 0 && sample < 0) || (prevSample < 0 && sample >= 0)) {
       zcr++;
     }
+    const normalizedIdx = i / audioData.length;
+    weightedSum += Math.abs(sample) * normalizedIdx;
+    freqWeight += Math.abs(sample);
     prevSample = sample;
   }
 
   const rms = Math.sqrt(sum / audioData.length);
+  const rawCentroid = freqWeight > 0 ? weightedSum / freqWeight : 0.3;
+  const zcrFactor = Math.min(1, zcr / audioData.length * 4);
+  const centroid = Math.min(0.95, Math.max(0.05, rawCentroid * 0.6 + zcrFactor * 0.4));
+
   return {
     rms: rms,
     peak: peak,
     energy: energy / audioData.length,
     zcr: zcr / audioData.length,
-    centroid: Math.random() * 0.5 + 0.2
+    centroid: centroid
   };
 }
 

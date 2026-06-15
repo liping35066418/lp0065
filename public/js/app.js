@@ -410,7 +410,7 @@ function handleDetection(data) {
   AppState.detections.push(data);
   AppState.confidenceSum += data.confidence;
 
-  if (LangCounts[data.language] !== undefined) {
+  if (AppState.langCounts[data.language] !== undefined) {
     AppState.langCounts[data.language]++;
   }
 
